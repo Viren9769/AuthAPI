@@ -13,6 +13,7 @@ using Microsoft.IdentityModel.Tokens;
 using System.IdentityModel.Tokens.Jwt;
 using System.Numerics;
 using System.Security.Claims;
+using System.Security.Cryptography;
 using System.Security.Cryptography.Xml;
 using System.Text;
 using System.Text.RegularExpressions;
@@ -73,12 +74,23 @@ namespace AuthAPI.Controllers
 
             // Create jwt token 
             user.Token = CreateJwt(user);
+            var newAccessToken = user.Token;
+            var newRefreshToken = CreateRefreshToken();
+            user.RefreshToken = newRefreshToken;
+            user.RefreshTokenExpiryTime = DateTime.UtcNow.AddDays(5);
+            await _dbContext.SaveChangesAsync();
             // if found then return login success
-            return Ok(new
+            /* return Ok(new
+             {
+                 Token = user.Token,
+                 Message = "Login Success!",
+                    // User = userResponse
+             });*/
+
+            return Ok(new TokenApiDto()
             {
-                Token = user.Token,
-                Message = "Login Success!",
-                   // User = userResponse
+                AccessToken = newAccessToken,
+                RefreshToken = newRefreshToken
             });
             }
 
@@ -145,19 +157,56 @@ namespace AuthAPI.Controllers
             var identity = new ClaimsIdentity(new Claim[]
             {
                 new Claim(ClaimTypes.Role, user.Role),
-                new Claim(ClaimTypes.Name,$"{user.FirstName}:{user.LastName}")
+                new Claim(ClaimTypes.Name,$"{user.UserName}")
             });
             var credentials = new SigningCredentials(new SymmetricSecurityKey(key), SecurityAlgorithms.HmacSha256);
             var tokenDescriptor = new SecurityTokenDescriptor
             {
                 Subject = identity,
                 //Expires = DateTime.Now.AddDays(1),
-                Expires = DateTime.UtcNow.AddDays(1),
+                Expires = DateTime.UtcNow.AddSeconds(10),
                 SigningCredentials = credentials
             };
             var token = jwtTokenHandler.CreateToken(tokenDescriptor);
             return jwtTokenHandler.WriteToken(token);
         }
+
+
+        // Create refresh Token 
+        private string CreateRefreshToken()
+        {
+            var tokenBytes = RandomNumberGenerator.GetBytes(264);
+            var refreshToken = Convert.ToBase64String(tokenBytes);
+
+            var tokenInUSer = _dbContext.Users
+                .Any(a => a.RefreshToken == refreshToken);
+            if(tokenInUSer)
+            {
+                return CreateRefreshToken();
+            }
+            return refreshToken;
+        }
+
+        private ClaimsPrincipal GetPrincipleFromExpireToken(string token)
+        {
+            var key = Encoding.ASCII.GetBytes("veryverysceretveryverysceretveryverysceret.....");
+            var tokenvalidationParameter = new TokenValidationParameters
+            {
+                ValidateAudience = false,
+                ValidateIssuer = false,
+                ValidateIssuerSigningKey = true,
+                IssuerSigningKey = new SymmetricSecurityKey(key),
+                ValidateLifetime = false
+            };
+            var tokenHandler = new JwtSecurityTokenHandler();
+            SecurityToken securityToken;
+            var principle = tokenHandler.ValidateToken(token, tokenvalidationParameter, out securityToken);
+            var jwtSecurityToken = securityToken as JwtSecurityToken;
+            if (jwtSecurityToken == null || !jwtSecurityToken.Header.Alg.Equals(SecurityAlgorithms.HmacSha256, StringComparison.InvariantCultureIgnoreCase)) 
+                throw new SecurityTokenException("this is a Invalid Token");
+                return principle;
+        }
+
 
         // get all the user 
         [Authorize]
@@ -165,6 +214,37 @@ namespace AuthAPI.Controllers
         public async Task<ActionResult<User>> GetAllUsers()
         {
             return Ok(await _dbContext.Users.ToListAsync());
+        }
+
+        //create a api for the refresh token 
+        [HttpPost("refresh")]
+        public async Task<IActionResult> Refresh(TokenApiDto tokenApiDto)   //tokenApiDto this will take the token and give the new token 
+        {
+            if(tokenApiDto == null)
+            {
+                return BadRequest("invalid Client Request");
+
+            }
+            string accessToken = tokenApiDto.AccessToken;
+            string refreshToken = tokenApiDto.RefreshToken;
+
+            var principal = GetPrincipleFromExpireToken(accessToken);
+            var username = principal.Identity.Name;
+            var user = await _dbContext.Users.FirstOrDefaultAsync(u => u.UserName == username);
+            if(user == null || user.RefreshToken !=  refreshToken || user.RefreshTokenExpiryTime <= DateTime.UtcNow)
+            {
+                return BadRequest("Invalid Request");
+            }
+            var newAccessToken = CreateJwt(user);
+            var newRefreahToken = CreateRefreshToken();
+            user.RefreshToken = newRefreahToken;
+            await _dbContext.SaveChangesAsync();
+            return Ok(new TokenApiDto()
+            {
+                AccessToken = newAccessToken,
+                RefreshToken = refreshToken,
+            });
+
         }
     }
 }
